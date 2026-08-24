@@ -1,6 +1,10 @@
+// src/sandbox.rs
 use crate::cache::{CachedMessage, ChannelCache};
-use deno_core::{JsRuntime, OpState, PollEventLoopOptions, RuntimeOptions, extension, op2};
+use deno_core::{
+    JsRuntime, OpState, PollEventLoopOptions, RuntimeOptions, extension, op2, scope, serde_v8, v8,
+};
 use deno_error::JsError;
+use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -60,6 +64,25 @@ const JS_BOOTSTRAP: &str = r#"
 ((globalThis) => {
     const { ops } = Deno.core;
 
+    globalThis.__console_logs = [];
+    globalThis.console = {
+        log: (...args) => {
+            globalThis.__console_logs.push(
+                args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ')
+            );
+        },
+        error: (...args) => {
+            globalThis.__console_logs.push(
+                "[ERROR] " + args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ')
+            );
+        },
+        warn: (...args) => {
+            globalThis.__console_logs.push(
+                "[WARN] " + args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ')
+            );
+        }
+    };
+
     class Channel {
         constructor(id) {
             this.id = id;
@@ -94,8 +117,7 @@ pub fn run_js_eval_sync(
     msg: MessageCreate,
     js_code: String,
     timeout_duration: Duration,
-) -> anyhow::Result<()> {
-    // Create a single-threaded runtime local to this blocking thread for driving JS ops
+) -> anyhow::Result<JsonValue> {
     let local_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -118,24 +140,50 @@ pub fn run_js_eval_sync(
 
         runtime.execute_script("bootstrap.js", JS_BOOTSTRAP)?;
 
+        // 1. Safely hydrate context using standard JSON serialization for zero syntax errors
         let hydration_script = format!(
-            "globalThis.message = new Message({{ id: '{}', content: '{}', author: '{}', channelId: '{}' }});",
-            msg.id,
-            msg.content.replace('\\', "\\\\").replace('\'', "\\'"),
-            msg.author.name.replace('\\', "\\\\").replace('\'', "\\'"),
-            msg.channel_id
+            "globalThis.message = new Message({{ id: {}, content: {}, author: {}, channelId: {} }});",
+            serde_json::to_string(&msg.id.to_string())?,
+            serde_json::to_string(&msg.content)?,
+            serde_json::to_string(&msg.author.name)?,
+            serde_json::to_string(&msg.channel_id.to_string())?
         );
         runtime.execute_script("hydrate.js", hydration_script)?;
 
-        let wrapped_script = format!("(async () => {{\n{}\n}})()", js_code);
-        runtime.execute_script("user_code.js", wrapped_script)?;
+        // 2. Wrap using eval() so expressions automatically yield their return value
+        let escaped_code = serde_json::to_string(&js_code)?;
+        let wrapped_script = format!(
+            r#"(async () => {{
+                globalThis.__console_logs = [];
+                let __ret = await (async () => {{
+                    return eval({escaped_code});
+                }})();
+                return {{
+                    return_value: __ret !== undefined ? __ret : null,
+                    logs: globalThis.__console_logs || []
+                }};
+            }})()"#
+        );
 
-        let poll_options = PollEventLoopOptions::default();
-        tokio::time::timeout(timeout_duration, runtime.run_event_loop(poll_options))
-            .await
-            .map_err(|_| anyhow::anyhow!("Execution timed out"))?
-            .map_err(|e| anyhow::anyhow!("Runtime error: {}", e))?;
+        let promise_val = runtime.execute_script("user_code.js", wrapped_script)?;
 
-        Ok(())
+        // 3. Resolve promise with event loop pump
+        let resolve_fut = runtime.resolve(promise_val);
+        let resolved_val = tokio::time::timeout(
+            timeout_duration,
+            runtime.with_event_loop_promise(resolve_fut, PollEventLoopOptions::default()),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Execution timed out"))?
+        .map_err(|e| anyhow::anyhow!("Runtime error: {}", e))?;
+
+        // 4. Extract into serde_json::Value
+        scope!(scope, &mut runtime);
+        let local_val = v8::Local::new(scope, resolved_val);
+
+        let json_value: JsonValue = serde_v8::from_v8(scope, local_val)
+            .unwrap_or(JsonValue::Null);
+
+        Ok(json_value)
     })
 }

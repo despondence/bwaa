@@ -1,3 +1,4 @@
+// src/cache.rs
 use dashmap::DashMap;
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -5,12 +6,11 @@ use std::sync::Arc;
 use twilight_model::id::Id;
 use twilight_model::id::marker::ChannelMarker;
 
-use crate::googleapis::google::ai::generativelanguage::v1beta::Content;
 use crate::googleapis::google::ai::generativelanguage::v1beta::part::Data;
+use crate::googleapis::google::ai::generativelanguage::v1beta::{Content, Part};
 
-const MAX_HISTORY_PER_CHANNEL: usize = 10;
+const MAX_HISTORY_PER_CHANNEL: usize = 12;
 
-// Struct sent across V8 bridge into Deno JS ops
 #[derive(Debug, Clone, Serialize)]
 pub struct CachedMessage {
     pub role: String,
@@ -29,7 +29,17 @@ impl ChannelCache {
         }
     }
 
-    pub fn push(&self, channel_id: Id<ChannelMarker>, content: Content) {
+    /// Pushes a turn to history, ensuring only text parts are preserved
+    pub fn push(&self, channel_id: Id<ChannelMarker>, mut content: Content) {
+        // Strip any non-text parts (like FunctionCall/FunctionResponse) before saving
+        content
+            .parts
+            .retain(|p| matches!(p.data, Some(Data::Text(_))));
+
+        if content.parts.is_empty() {
+            return;
+        }
+
         let mut queue = self.store.entry(channel_id).or_insert_with(VecDeque::new);
         queue.push_back(content);
         if queue.len() > MAX_HISTORY_PER_CHANNEL {
@@ -44,7 +54,6 @@ impl ChannelCache {
             .unwrap_or_default()
     }
 
-    // Helper: Converts gRPC Content structs into flat, serializable CachedMessage objects for JS
     pub fn to_cached_messages(
         &self,
         channel_id: Id<ChannelMarker>,

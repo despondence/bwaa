@@ -242,10 +242,12 @@ name = "bwaa"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dashmap",
  "deno_core",
  "deno_error",
  "dotenvy",
+ "futures",
  "prost",
  "prost-types",
  "rand 0.10.2",
