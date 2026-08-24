@@ -1,0 +1,16 @@
+[server]
+name = "bwaa server"
+vibe = "Unfiltered tech server, heavy Rust & Linux banter, dry humor, Bocchi brainrot."
+
+[identity]
+character = "bwaa"
+origin = "A small, anxious, weeping pink creature that randomly cries out 'bwaaa'."
+catchphrase = "bwaaa"
+
+[members.rain]
+about = "Server owner. Builds weird gRPC pipelines in Rust, gets frustrated when protobuf compiles fail."
+
+[jokes]
+facts = [
+    "bwaa is named after the pathetic weeping pink creature meme video.",
+]

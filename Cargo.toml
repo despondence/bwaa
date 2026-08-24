@@ -1,0 +1,29 @@
+[package]
+name = "bwaa"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { version = "1.0.104", default-features = false }
+dashmap = { version = "6.2.1", default-features = false }
+dotenvy = { version = "0.15.7", default-features = false }
+prost = { version = "0.14.4", default-features = false }
+prost-types = { version = "0.14.4", default-features = false }
+rand = { version = "0.10.2", default-features = false, features = ["thread_rng"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["brotli", "charset", "cookies", "deflate", "gzip", "http2", "multipart", "query", "rustls", "stream", "zstd"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt-multi-thread", "sync"] }
+tokio-stream = { version = "0.1.19", default-features = false, features = ["sync"] }
+tonic = { version = "0.14.6", default-features = false, features = ["channel", "codegen", "deflate", "gzip", "tls-aws-lc", "tls-webpki-roots", "zstd"] }
+tonic-prost = { version = "0.14.6", default-features = false }
+tonic-prost-build = { version = "0.14.6", default-features = false }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "env-filter"] }
+twilight-gateway = { version = "0.17.1", default-features = false, features = ["rustls-webpki-roots", "zstd"] }
+twilight-http = { version = "0.17.1", default-features = false, features = ["decompression", "rustls-webpki-roots"] }
+twilight-model = { version = "0.17.1", default-features = false }
+
+[build-dependencies]
+tonic-prost-build = { version = "0.14.6", default-features = false }
