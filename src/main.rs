@@ -6,6 +6,7 @@ mod googleapis;
 mod handler;
 mod media;
 mod memory;
+mod sandbox;
 
 use rand::RngExt;
 use std::sync::Arc;
@@ -60,8 +61,8 @@ async fn main() -> anyhow::Result<()> {
         // 1. Clean mentions out of prompt text
         let prompt = clean_prompt(&msg);
 
-        // 2. Format incoming message and process attached media
-        let mut user_text = format!("{}: {}", msg.author.name, prompt);
+        // 2. Format incoming message with Message ID context so model can target actions
+        let mut user_text = format!("[Msg ID: {}] {}: {}", msg.id, msg.author.name, prompt);
         let mut parts = process_attachments(&msg, &mut user_text).await;
         parts.insert(
             0,

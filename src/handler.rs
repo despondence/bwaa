@@ -1,10 +1,13 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 use twilight_http::Client as HttpClient;
 use twilight_http::request::channel::reaction::RequestReactionType;
 use twilight_model::gateway::payload::incoming::MessageCreate;
+use twilight_model::id::Id;
+use twilight_model::id::marker::{EmojiMarker, MessageMarker};
 
 use crate::cache::ChannelCache;
 use crate::gemini::Gemini;
@@ -16,12 +19,35 @@ use crate::memory::MemoryDb;
 
 const MODEL_NAME: &str = "models/gemini-3.1-flash-lite";
 
-#[derive(Deserialize)]
-pub struct BotAction {
-    pub should_reply: Option<bool>,
-    pub reason: Option<String>,
-    pub reply: Option<String>,
-    pub reaction: Option<String>,
+/// Granular, flexible actions Gemini can choose to execute.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Action {
+    /// Add a Unicode or custom reaction to a specific message.
+    AddReaction {
+        #[serde(default)]
+        message_id: Option<String>,
+        /// Can be a unicode emoji ("👍") or a custom emoji name ("pepe")
+        emoji_name: String,
+        /// Required only if using a custom guild emoji
+        emoji_id: Option<String>,
+    },
+    /// Send a message to the channel (either as a reply or raw message).
+    SendMessage {
+        content: String,
+        #[serde(default)]
+        reply_to_message_id: Option<String>,
+    },
+    /// Execute JavaScript inside the Deno sandbox runtime.
+    ExecuteJs { code: String },
+    /// Explicitly decide to do nothing.
+    DoNothing,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DecisionResponse {
+    pub reason: String,
+    pub actions: Vec<Action>,
 }
 
 pub async fn handle_chat_turn(
@@ -43,7 +69,7 @@ pub async fn handle_chat_turn(
 
     let _ = http.create_typing_trigger(msg.channel_id).await;
 
-    // Recall SQLite memory for current prompt and inject into the user's latest turn
+    // Recall SQLite memory for current prompt and inject into the user's turn
     let recalled = db.recall_memories(&prompt)?;
     if !recalled.is_empty() {
         if let Some(last_turn) = history.last_mut() {
@@ -129,63 +155,158 @@ pub async fn handle_chat_turn(
 
     tracing::debug!(raw_json = %raw_text, "Unwrapped raw response JSON");
 
-    let action: BotAction = serde_json::from_str(raw_text).unwrap_or(BotAction {
-        should_reply: Some(true),
-        reason: Some("Failed JSON parse fallback".into()),
-        reply: Some(raw_text.to_string()),
-        reaction: None,
+    let decision: DecisionResponse = serde_json::from_str(raw_text).unwrap_or_else(|e| {
+        tracing::warn!(error = ?e, "Failed to parse structured actions; using raw text fallback");
+        DecisionResponse {
+            reason: "Fallback parse".into(),
+            actions: vec![Action::SendMessage {
+                content: raw_text.to_string(),
+                reply_to_message_id: Some(msg.id.to_string()),
+            }],
+        }
     });
 
     tracing::info!(
-        should_reply = action.should_reply.unwrap_or(false),
-        reason = %action.reason.as_deref().unwrap_or("none"),
-        "Model autonomous decision evaluated"
+        reason = %decision.reason,
+        action_count = decision.actions.len(),
+        "Model decision processing"
     );
 
-    // Dispatch reaction side-effect
-    if let Some(emoji) = &action.reaction {
-        let http = Arc::clone(&http);
-        let channel_id = msg.channel_id;
-        let message_id = msg.id;
-        let emoji_clone = emoji.clone();
-        tokio::spawn(async move {
-            let reaction_type = RequestReactionType::Unicode { name: &emoji_clone };
-            if let Err(e) = http
-                .create_reaction(channel_id, message_id, &reaction_type)
-                .await
-            {
-                tracing::error!(error = ?e, emoji = %emoji_clone, "Failed to apply Discord reaction");
+    // Group reactions by target message ID to preserve strict order per message
+    let mut sequential_reactions: HashMap<Id<MessageMarker>, Vec<(String, Option<String>)>> =
+        HashMap::new();
+
+    for action in decision.actions {
+        match action {
+            Action::AddReaction {
+                message_id,
+                emoji_name,
+                emoji_id,
+            } => {
+                let target_msg_id = message_id
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(Id::<MessageMarker>::new)
+                    .unwrap_or(msg.id);
+
+                sequential_reactions
+                    .entry(target_msg_id)
+                    .or_default()
+                    .push((emoji_name, emoji_id));
             }
-        });
-    }
 
-    // Dispatch reply text if decision was positive
-    if action.should_reply.unwrap_or(true) {
-        if let Some(reply_text) = &action.reply {
-            let trimmed = reply_text.trim();
-            if !trimmed.is_empty() {
-                cache.push(
-                    msg.channel_id,
-                    Content {
-                        role: "model".into(),
-                        parts: vec![Part {
-                            data: Some(Data::Text(trimmed.to_string())),
-                            ..Default::default()
-                        }],
-                    },
-                );
+            Action::SendMessage {
+                content,
+                reply_to_message_id,
+            } => {
+                let http = Arc::clone(&http);
+                let cache = cache.clone();
+                let channel_id = msg.channel_id;
 
-                for chunk in trimmed.as_bytes().chunks(1900) {
-                    let chunk_str = std::str::from_utf8(chunk)?;
-                    http.create_message(msg.channel_id)
-                        .content(chunk_str)
-                        .reply(msg.id)
-                        .await?;
-                }
+                // Spawn message sending in parallel immediately
+                tokio::spawn(async move {
+                    let trimmed = content.trim();
+                    if trimmed.is_empty() {
+                        return;
+                    }
+
+                    cache.push(
+                        channel_id,
+                        Content {
+                            role: "model".into(),
+                            parts: vec![Part {
+                                data: Some(Data::Text(trimmed.to_string())),
+                                ..Default::default()
+                            }],
+                        },
+                    );
+
+                    let target_reply_id = reply_to_message_id
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(Id::<MessageMarker>::new);
+
+                    for chunk in trimmed.as_bytes().chunks(1900) {
+                        if let Ok(chunk_str) = std::str::from_utf8(chunk) {
+                            let mut builder = http.create_message(channel_id).content(chunk_str);
+                            if let Some(reply_id) = target_reply_id {
+                                builder = builder.reply(reply_id);
+                            }
+                            if let Err(e) = builder.await {
+                                tracing::error!(error = ?e, "Failed to send message chunk");
+                            }
+                        }
+                    }
+                });
+            }
+
+            Action::ExecuteJs { code } => {
+                let http = Arc::clone(&http);
+                let cache = cache.clone();
+                let msg_clone = msg.clone();
+
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = crate::sandbox::run_js_eval_sync(
+                        Arc::clone(&http),
+                        cache,
+                        msg_clone.clone(),
+                        code,
+                        Duration::from_secs(5),
+                    ) {
+                        tracing::error!(error = ?e, "Sandbox execution error");
+
+                        // Post the error back to Discord
+                        let err_msg = format!("```js\n[JS Eval Error]: {}\n```", e);
+                        let channel_id = msg_clone.channel_id;
+                        let msg_id = msg_clone.id;
+
+                        // Spawn a task on the current thread's handle to fire the HTTP reply
+                        tokio::runtime::Handle::current().spawn(async move {
+                            let _ = http
+                                .create_message(channel_id)
+                                .content(&err_msg)
+                                .reply(msg_id)
+                                .await;
+                        });
+                    }
+                });
+            }
+
+            Action::DoNothing => {
+                tracing::debug!("Model issued explicit DoNothing action");
             }
         }
-    } else {
-        tracing::debug!("bwaa decided to stay quiet");
+    }
+
+    // Dispatch reaction sequences per message target concurrently
+    for (target_msg_id, emojis) in sequential_reactions {
+        let http = Arc::clone(&http);
+        let channel_id = msg.channel_id;
+
+        tokio::spawn(async move {
+            for (emoji_name, emoji_id) in emojis {
+                let reaction_type = if let Some(id_str) = emoji_id {
+                    if let Ok(raw_id) = id_str.parse::<u64>() {
+                        RequestReactionType::Custom {
+                            id: Id::<EmojiMarker>::new(raw_id),
+                            name: Some(&emoji_name),
+                        }
+                    } else {
+                        RequestReactionType::Unicode { name: &emoji_name }
+                    }
+                } else {
+                    RequestReactionType::Unicode { name: &emoji_name }
+                };
+
+                if let Err(e) = http
+                    .create_reaction(channel_id, target_msg_id, &reaction_type)
+                    .await
+                {
+                    tracing::error!(error = ?e, "Failed to dispatch reaction action");
+                }
+
+                // 200ms delay ensures Discord places reactions strictly in array order
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
     }
 
     Ok(())
